@@ -919,7 +919,7 @@ def check_deps(cmdargs: argparse.Namespace) -> None:
         res['base-commit: MISSING'] = (False, 'Series with dependencies require a base-commit')
     elif allgood:
         logger.info('Testing if all patches can be applied to %s', base_commit)
-        tos, ccs, tstr, mypatches = get_prep_branch_as_patches(thread=False, movefrom=False, addtracking=False)
+        tos, ccs, froms, tstr, mypatches = get_prep_branch_as_patches(thread=False, movefrom=False, addtracking=False)
         if get_cover_strategy() == "commit":
             # If the cover letter is stored as a commit, skip it to avoid empty patches
             prereq_patches += [x[1] for x in mypatches[1:]]
@@ -1319,6 +1319,7 @@ def get_cover_dests(cbody: str) -> Tuple[List, List, str]:
     htrs, cmsg, mtrs, basement, sig = b4.LoreMessage.get_body_parts(cbody)
     tos = list()
     ccs = list()
+    fromaddr = set()
     for mtr in list(mtrs):
         if mtr.lname == 'to':
             tos.append(mtr.addr)
@@ -1326,8 +1327,14 @@ def get_cover_dests(cbody: str) -> Tuple[List, List, str]:
         elif mtr.lname == 'cc':
             ccs.append(mtr.addr)
             mtrs.remove(mtr)
+        elif mtr.lname == 'from':
+            if fromaddr:
+                logger.critical("CRITICAL: We can't have two authors for this series")
+                sys.exit(1)
+            fromaddr = mtr.value
+            mtrs.remove(mtr)
     cbody = b4.LoreMessage.rebuild_message(htrs, cmsg, mtrs, basement, sig)
-    return tos, ccs, cbody
+    return tos, ccs, fromaddr, cbody
 
 
 def add_cover(csubject: b4.LoreSubject, msgid_tpt: str, patches: List[Tuple[str, email.message.Message]],
@@ -1579,7 +1586,7 @@ def get_prep_branch_as_patches(movefrom: bool = True, thread: bool = True, addtr
     wrapped = textwrap.wrap('X-B4-Tracking: v=1; b=' + b64tracking, subsequent_indent=' ', width=75)
     thdata = ''.join(wrapped).replace('X-B4-Tracking: ', '')
 
-    alltos, allccs, cbody = get_cover_dests(cover_letter)
+    alltos, allccs, allfrom, cbody = get_cover_dests(cover_letter)
     if len(patches) == 1:
         mixin_cover(cbody, patches)
     else:
@@ -1603,7 +1610,7 @@ def get_prep_branch_as_patches(movefrom: bool = True, thread: bool = True, addtr
     if prefixes:
         header = '[' + ', '.join(prefixes) + f'] {header}'
     tag_msg = f'{header}\n\n{cover_letter}'
-    return alltos, allccs, tag_msg, patches
+    return alltos, allccs, allfrom, tag_msg, patches
 
 
 def get_sent_tag_as_patches(tagname: str, revision: int) -> Tuple[List, List, List[Tuple[str, email.message.Message]]]:
@@ -1623,18 +1630,18 @@ def get_sent_tag_as_patches(tagname: str, revision: int) -> Tuple[List, List, Li
                                       seriests=seriests,
                                       mailfrom=mailfrom)
 
-    alltos, allccs, cbody = get_cover_dests(cbody)
+    alltos, allccs, allfrom, cbody = get_cover_dests(cbody)
     if len(patches) == 1:
         mixin_cover(cbody, patches)
     else:
         add_cover(csubject, msgid_tpt, patches, cbody, seriests)
 
-    return alltos, allccs, patches
+    return alltos, allccs, allfrom, patches
 
 
 def format_patch(output_dir: str) -> None:
     try:
-        tos, ccs, tstr, patches = get_prep_branch_as_patches(thread=False, movefrom=False, addtracking=False)
+        tos, ccs, fromsrc, tstr, patches = get_prep_branch_as_patches(thread=False, movefrom=False, addtracking=False)
     except RuntimeError as ex:
         logger.critical('CRITICAL: Failed to convert range to patches: %s', ex)
         sys.exit(1)
@@ -1680,7 +1687,7 @@ def check(cmdargs: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        todests, ccdests, tag_msg, patches = get_prep_branch_as_patches(expandprereqs=False)
+        todests, ccdests, fromdests, tag_msg, patches = get_prep_branch_as_patches(expandprereqs=False)
     except RuntimeError as ex:
         logger.critical('CRITICAL: Failed to convert range to patches: %s', ex)
         sys.exit(1)
@@ -1764,7 +1771,7 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
             tagname, revision = get_sent_tagname(mybranch, SENT_TAG_PREFIX, revstr)
 
         try:
-            todests, ccdests, patches = get_sent_tag_as_patches(tagname, revision=revision)
+            todests, ccdests, fromsrc, patches = get_sent_tag_as_patches(tagname, revision=revision)
         except RuntimeError as ex:
             logger.critical('CRITICAL: Failed to convert tag to patches: %s', ex)
             sys.exit(1)
@@ -1784,7 +1791,7 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
             prefixes = None
 
         try:
-            todests, ccdests, tag_msg, patches = get_prep_branch_as_patches(prefixes=prefixes)
+            todests, ccdests, fromsrc, tag_msg, patches = get_prep_branch_as_patches(prefixes=prefixes)
         except RuntimeError as ex:
             logger.critical('CRITICAL: Failed to convert range to patches: %s', ex)
             sys.exit(1)
@@ -2067,6 +2074,9 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
                 msg.replace_header('Cc', b4.format_addrs(pcc))
             else:
                 msg.add_header('Cc', b4.format_addrs(pcc))
+        if fromsrc:
+            payload = "From: " + fromsrc + "\n\n" + msg.get_payload()
+            msg.set_payload(payload, charset='utf-8')
 
         send_msgs.append(msg)
 
@@ -2460,7 +2470,7 @@ def get_info(usebranch: str) -> Dict[str, str]:
     csubject, cbody = get_cover_subject_body(cover)
     ts = tracking['series']
     base_commit, start_commit, end_commit, oneline, shortlog, diffstat = get_series_details(usebranch=usebranch)
-    todests, ccdests, tag_msg, patches = get_prep_branch_as_patches(usebranch=usebranch, expandprereqs=False)
+    todests, ccdests, fromdests, tag_msg, patches = get_prep_branch_as_patches(usebranch=usebranch, expandprereqs=False)
     prereqs = tracking['series'].get('prerequisites', list())
     tocmd, cccmd = get_auto_to_cc_cmds()
     ppcmds, scmds = get_check_cmds()
@@ -2631,7 +2641,7 @@ def auto_to_cc() -> None:
             extras.append(ltr)
 
     try:
-        tos, ccs, tag_msg, patches = get_prep_branch_as_patches()
+        tos, ccs, fromsrc, tag_msg, patches = get_prep_branch_as_patches()
     except RuntimeError:
         logger.info('No commits in branch')
         return
@@ -2673,7 +2683,7 @@ def get_preflight_hash(usebranch: Optional[str] = None) -> str:
     global PFHASH_CACHE
     cachebranch = usebranch if usebranch is not None else '_current_'
     if cachebranch not in PFHASH_CACHE:
-        tos, ccs, tstr, patches = get_prep_branch_as_patches(movefrom=False, thread=False, addtracking=False,
+        tos, ccs, froms, tstr, patches = get_prep_branch_as_patches(movefrom=False, thread=False, addtracking=False,
                                                              usebranch=usebranch, expandprereqs=False)
         hashed = hashlib.sha1()
         for commit, msg in patches:
